@@ -1,0 +1,8 @@
+.Rhistory
+.RDataTmp
+.RData
+.Rproj.user/
+data/raw/
+
+# Ignore original large reviews file
+data/new_orleans/reviews_new_orleans.rds
