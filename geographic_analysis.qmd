@@ -1,0 +1,449 @@
+---
+title: "Homework 6: Geographic Analysis"
+format:
+  html:
+    toc: true
+    code-fold: false
+    embed-resources: true
+---
+
+```{r}
+#| include: false
+options(tigris_use_cache = TRUE)
+```
+
+## Introduction
+
+This analysis examines the geographic distribution of restaurants in New Orleans using the Yelp Open Dataset. The goal is to compare geographic areas and select an appropriate unit for analyzing restaurant ratings and review activity.
+
+## Load Packages
+
+```{r}
+library(tidyverse)
+library(sf)
+library(tigris)
+library(knitr)
+```
+
+## Load Cleaned Data
+
+```{r}
+restaurants <- readRDS("data/new_orleans/business_new_orleans.rds")
+
+glimpse(restaurants)
+```
+
+## Restaurant Dataset Summary
+
+```{r}
+restaurants |>
+  summarise(
+    total_restaurants = n(),
+    average_rating = mean(stars, na.rm = TRUE),
+    total_reviews = sum(review_count, na.rm = TRUE)
+  ) |>
+  knitr::kable()
+```
+
+# Download Louisiana Census tract and ZCTA boundaries
+```{r}
+#| message: false
+#| warning: false
+#| results: "hide"
+
+tracts <- tigris::tracts(
+  state = "LA",
+  county = "Orleans",
+  year = 2024,
+  cb = TRUE,
+  class = "sf"
+)
+
+zctas <- tigris::zctas(
+  year = 2020,
+  cb = TRUE,
+  class = "sf"
+)
+```
+## Additional Geographic Boundaries
+
+```{r}
+#| message: false
+#| warning: false
+#| results: "hide"
+
+block_groups <- tigris::block_groups(
+  state = "LA",
+  county = "Orleans",
+  year = 2024,
+  cb = TRUE,
+  class = "sf"
+) |>
+  st_transform(4326)
+```
+## Load Neighborhood Boundaries
+
+```{r}
+#| message: false
+#| warning: false
+#| results: "hide"
+
+neighborhoods <- st_read(
+  "data/geography/neighborhoods.geojson",
+  quiet = TRUE
+) |>
+  st_transform(4326)
+
+# Create a consistent identifier for each neighborhood
+neighborhoods <- neighborhoods |>
+  mutate(area_id = as.character(row_number()))
+```
+
+# Convert restaurant coordinates into spatial points
+```{r}
+restaurant_points <- restaurants |>
+  filter(!is.na(latitude), !is.na(longitude)) |>
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+```
+
+# Match coordinate systems
+```{r}
+tracts <- st_transform(tracts, 4326)
+zctas <- st_transform(zctas, 4326)
+```
+
+# Spatial joins
+```{r}
+restaurants_tracts <- st_join(
+  restaurant_points,
+  tracts |> select(GEOID),
+  left = FALSE
+)
+
+restaurants_zctas <- st_join(
+  restaurant_points,
+  zctas |> select(ZCTA5CE20),
+  left = FALSE
+)
+```
+
+## Additional Spatial Joins
+
+```{r}
+restaurants_blocks <- st_join(
+  restaurant_points,
+  block_groups |> select(GEOID),
+  left = FALSE
+)
+
+restaurants_neighborhoods <- st_join(
+  restaurant_points,
+  neighborhoods |> select(area_id),
+  left = FALSE
+)
+```
+
+## Geographic System Comparison
+
+This table compares four geographic systems using restaurant coverage, sample sizes, and business ratings. Areas with zero restaurants are included.
+
+```{r}
+# Orleans Parish boundary
+orleans_boundary <- st_union(tracts)
+
+# Restrict ZCTAs and neighborhoods to Orleans Parish
+local_zctas <- st_filter(zctas, orleans_boundary)
+local_neighborhoods <- st_filter(neighborhoods, orleans_boundary)
+
+# Function to compare geographic systems
+compare_geography <- function(boundaries, id_column, system_name) {
+
+  # Spatially assign restaurants to areas
+  assigned <- st_join(
+    restaurant_points,
+    boundaries |> select(all_of(id_column)),
+    left = TRUE
+  ) |>
+    st_drop_geometry() |>
+    mutate(area_id = as.character(.data[[id_column]]))
+
+  # Check for restaurants matching multiple areas
+  multiple_matches <- assigned |>
+    filter(!is.na(area_id)) |>
+    count(business_id) |>
+    filter(n > 1) |>
+    nrow()
+
+  # Keep only unambiguous restaurant assignments
+  matched <- assigned |>
+    filter(!is.na(area_id)) |>
+    group_by(business_id) |>
+    filter(n() == 1) |>
+    ungroup()
+
+  # Calculate restaurant counts and average ratings
+  area_summary <- matched |>
+    group_by(area_id) |>
+    summarise(
+      restaurant_count = n(),
+      average_rating = mean(stars, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  # Include geographic areas with zero restaurants
+  all_areas <- boundaries |>
+    st_drop_geometry() |>
+    transmute(area_id = as.character(.data[[id_column]])) |>
+    distinct() |>
+    left_join(area_summary, by = "area_id") |>
+    mutate(
+      restaurant_count = replace_na(restaurant_count, 0L)
+    )
+
+  tibble(
+    geographic_system = system_name,
+    number_of_areas = nrow(all_areas),
+    restaurants_assigned = n_distinct(matched$business_id),
+    unmatched_restaurants =
+      nrow(restaurants) - n_distinct(matched$business_id),
+    multiple_area_matches = multiple_matches,
+    smallest_area_count = min(all_areas$restaurant_count),
+    largest_area_count = max(all_areas$restaurant_count),
+    average_restaurants_per_area =
+      mean(all_areas$restaurant_count),
+    median_restaurants_per_area =
+      median(all_areas$restaurant_count),
+    areas_under_5 =
+      sum(all_areas$restaurant_count < 5),
+    average_business_rating =
+      mean(matched$stars, na.rm = TRUE)
+  )
+}
+
+comparison_full <- bind_rows(
+  compare_geography(tracts, "GEOID", "Census tracts"),
+  compare_geography(local_zctas, "ZCTA5CE20", "ZCTAs"),
+  compare_geography(block_groups, "GEOID", "Census block groups"),
+  compare_geography(local_neighborhoods, "area_id", "Neighborhoods")
+)
+
+knitr::kable(
+  comparison_full,
+  digits = 2,
+  caption = "Comparison of Four Geographic Systems in New Orleans"
+)
+```
+
+Geographic boundaries were obtained from the U.S. Census Bureau and the City of New Orleans. Census tracts and block groups use 2024 boundaries, while ZCTAs use 2020 boundaries. Neighborhood Statistical Areas use the city's published dataset. Differences in boundary definitions and years may affect geographic comparisons.
+
+## Census Tract Restaurant Ratings
+
+```{r}
+tract_ratings <- restaurants_tracts |>
+  st_drop_geometry() |>
+  group_by(GEOID) |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    average_rating = mean(stars, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  arrange(desc(restaurant_count))
+
+knitr::kable(
+  head(tract_ratings, 10),
+  digits = 2,
+  caption = "Ten Census Tracts with the Most Restaurants"
+)
+```
+
+## Geographic Distribution of Restaurants
+
+```{r}
+tract_counts <- restaurants_tracts |>
+  st_drop_geometry() |>
+  count(GEOID, name = "restaurant_count")
+
+tract_map <- tracts |>
+  left_join(tract_counts, by = "GEOID") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(tract_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution Across Orleans Parish",
+    subtitle = "Yelp restaurants by Census tract",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+
+## Additional Geographic Maps
+
+The following maps show restaurant distribution using three additional geographic systems. Comparing these maps helps illustrate how geographic boundaries affect the level of detail in the analysis.
+
+### Census Block Group Map
+
+```{r}
+block_counts <- restaurants_blocks |>
+  st_drop_geometry() |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    .by = GEOID
+  )
+
+block_map <- block_groups |>
+  left_join(block_counts, by = "GEOID") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(block_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution by Census Block Group",
+    subtitle = "Orleans Parish, Louisiana",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+### ZCTA Map
+
+```{r}
+zcta_counts <- restaurants_zctas |>
+  st_drop_geometry() |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    .by = ZCTA5CE20
+  )
+
+zcta_map <- local_zctas |>
+  left_join(zcta_counts, by = "ZCTA5CE20") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(zcta_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.2
+  ) +
+  coord_sf(
+    xlim = st_bbox(tracts)[c("xmin", "xmax")],
+    ylim = st_bbox(tracts)[c("ymin", "ymax")]
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution by ZCTA",
+    subtitle = "ZCTAs intersecting Orleans Parish",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+### Neighborhood Map
+
+```{r}
+neighborhood_counts <- restaurants_neighborhoods |>
+  st_drop_geometry() |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    .by = area_id
+  )
+
+neighborhood_map <- local_neighborhoods |>
+  left_join(neighborhood_counts, by = "area_id") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(neighborhood_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.2
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution by Neighborhood",
+    subtitle = "New Orleans Neighborhood Statistical Areas",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+### Map Comparison
+
+The maps show how restaurant distribution changes depending on the geographic system. Census block groups provide the most detailed view, but many contain few restaurants. ZCTAs cover larger areas and show broader patterns. Neighborhoods provide an intermediate level of detail. Census tracts offer a balance between geographic detail and restaurant sample size, making them a reasonable choice for this analysis.
+
+# Calculate average Yelp ratings by Census tract
+
+```{r}
+tract_rating_summary <- restaurants_tracts |>
+  st_drop_geometry() |>
+  group_by(GEOID) |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    average_rating = mean(stars, na.rm = TRUE),
+    .groups = "drop"
+  )
+```
+
+# Join ratings to Census tract boundaries
+```{r}
+tract_rating_map <- tracts |>
+  left_join(tract_rating_summary, by = "GEOID")
+```
+
+# Map average ratings
+```{r}
+ggplot(tract_rating_map) +
+  geom_sf(
+    aes(fill = average_rating),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    limits = c(1, 5),
+    na.value = "grey90"
+  ) +
+  labs(
+    title = "Average Yelp Restaurant Ratings by Census Tract",
+    subtitle = "Orleans Parish, Louisiana",
+    fill = "Average Rating"
+  ) +
+  theme_minimal()
+```
+
+## Research Question
+
+Which geographic system provides the most useful balance between geographic detail and restaurant sample size for analyzing restaurant distribution and Yelp ratings across New Orleans?
+
+## Selected Geographic Area: Census Tracts
+
+I chose Census tracts to analyze restaurant locations and Yelp ratings in New Orleans. I compared four geographic systems: Census tracts, ZCTAs, Census block groups, and neighborhoods.
+
+Census tracts divide Orleans Parish into 184 areas, with 2,202 out of 2,259 restaurants successfully matched. The median is 4 restaurants per tract, compared to 6 for ZCTAs, 1 for block groups, and 11 for neighborhoods. ZCTAs and neighborhoods have more restaurants per area, but their larger boundaries can hide smaller differences in restaurant locations. Block groups provide the most detail, but 342 out of 440 have fewer than five restaurants, making comparisons difficult.
+
+The maps show that restaurants are not evenly distributed across New Orleans. Some areas have many restaurants, while others have very few. The Yelp rating map also allows us to compare average ratings across Census tracts. However, 95 out of 184 tracts have fewer than five restaurants, so their average ratings may not be very reliable.
+
+Overall, I chose Census tracts because they provide more geographic detail than ZCTAs and neighborhoods without dividing the city into as many small areas as block groups. Although some tracts have small sample sizes, Census tracts are a reasonable choice for studying differences in restaurant locations and Yelp ratings across New Orleans.
