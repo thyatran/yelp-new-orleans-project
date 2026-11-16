@@ -57,7 +57,7 @@ README.md                         # Project overview and instructions
 
 ### View results without running code
 
-Open the [rendered HTML report](yelp_new_orleans_project.html) after downloading the repository, or use its published website link if available. The tables and maps are already rendered. Keep `yelp_new_orleans_project_files/` alongside the HTML so its supporting assets load correctly.
+Open the [rendered HTML report](docs/yelp_new_orleans_project.html) after downloading the repository, or use its published website link if available. The tables and maps are already rendered. Keep `yelp_new_orleans_project_files/` alongside the HTML so its supporting assets load correctly.
 
 ### Render the report from the cleaned data
 
