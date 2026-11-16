@@ -10,7 +10,7 @@ This project uses the Yelp Open Dataset to compare Cajun/Creole, Seafood, and So
 
 ## View the Final Report
 
-**[View the final HTML report](yelp_new_orleans_project.html)**
+**[View the final HTML report](docs/yelp_new_orleans_project.html)**
 
 The report includes tables, maps, results, interpretations, limitations, and AI prompt examples. For a browser-viewable public link, publish the HTML and its supporting assets (for example, using GitHub Pages).
 
