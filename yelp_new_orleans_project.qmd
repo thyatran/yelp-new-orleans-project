@@ -1,0 +1,1204 @@
+---
+title: "Yelp New Orleans Restaurant Analysis"
+subtitle: "A project in data cleaning, joins, spatial analysis, and reviewer-adjusted ratings"
+date: last-modified
+format:
+  html:
+    toc: true
+    code-fold: true
+    code-tools: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## 1. Introduction & Research Question
+
+### 1.1 Project Overview
+
+This project uses the Yelp Open Dataset to analyze restaurants in New Orleans, Louisiana. It combines restaurant information, customer reviews, and geographic data to examine how restaurant ratings and locations vary across the city.
+
+The analysis includes data cleaning, category selection, relational joins, geographic comparisons, and reviewer-adjusted ratings. The goal is to identify highly rated restaurants within a selected category group and determine which geographic areas offer the strongest options.
+
+### 1.2 Research Question
+
+Which Cajun/Creole, Seafood, and Southern restaurants in New Orleans rank highest after adjusting for reviewer rating habits, and which census tracts offer the strongest restaurant options?
+
+### 1.3 Project Objectives
+
+- Select and analyze at least three related restaurant categories.
+- Compare restaurant ratings and review activity.
+- Evaluate different geographic systems for analyzing restaurant locations.
+- Compare ratings from all reviewers with reviewer-adjusted scores.
+- Identify the top 10 restaurants and map their locations.
+- Discuss findings, limitations, and data management decisions.
+
+## 2. Data Collection & Preparation (Homework 5)
+
+### 2.1 Data Source
+
+The data comes from the Yelp Open Dataset, which contains information about businesses and customer reviews.
+
+Two datasets were used:
+
+- **Business dataset:** Contains restaurant names, addresses, locations, ratings, review counts, and categories.
+- **Review dataset:** Contains individual customer ratings, review text, reviewer IDs, and review dates.
+
+The datasets are connected through `business_id`, allowing each restaurant to be matched with its customer reviews.
+
+Source: [Yelp Open Dataset](https://business.yelp.com/data/resources/open-dataset/)
+
+### 2.2 Data Importing & Cleaning
+
+The original Yelp data was provided as large JSON files. The business dataset was imported using `jsonlite::stream_in()`, while the review dataset was processed in smaller chunks to reduce memory usage.
+
+Only the columns needed for the analysis were retained.
+
+
+```{r}
+#| eval: false
+
+# File paths for the original Yelp JSON datasets
+business_file <- "data/raw/yelp_academic_dataset_business.json"
+review_file <- "data/raw/yelp_academic_dataset_review.json"
+
+# Import the business dataset
+business_raw <- jsonlite::stream_in(
+  file(business_file),
+  verbose = FALSE
+)
+
+# Filter review data in chunks to reduce memory usage
+restaurant_ids <- new_orleans_restaurants$business_id
+review_chunks <- list()
+con <- file(review_file, open = "r")
+
+repeat {
+  lines <- readLines(con, n = 10000, warn = FALSE)
+  if (length(lines) == 0) break
+
+  chunk <- jsonlite::stream_in(
+    textConnection(paste(lines, collapse = "\n")),
+    verbose = FALSE
+  )
+
+  chunk <- chunk |>
+    filter(business_id %in% restaurant_ids) |>
+    select(
+      review_id, business_id, user_id,
+      stars, date, text, useful, funny, cool
+    )
+
+  if (nrow(chunk) > 0) {
+    review_chunks[[length(review_chunks) + 1]] <- chunk
+  }
+}
+
+close(con)
+new_orleans_reviews <- bind_rows(review_chunks)
+```
+
+
+### 2.3 Filtering New Orleans Restaurants & Reviews
+
+Businesses were filtered to include those located in New Orleans, Louisiana, with "Restaurants" listed in their Yelp categories.
+
+The review dataset was then filtered using the selected restaurant business IDs, ensuring that only reviews associated with New Orleans restaurants were retained.
+
+### 2.4 Final Dataset Summary
+
+```{r}
+#| label: setup
+
+library(tidyverse)
+library(jsonlite)
+library(lubridate)
+library(sf)
+library(tigris)
+library(scales)
+library(viridis)
+
+options(tigris_use_cache = TRUE)
+
+# Load cleaned restaurant data from Homework 5
+restaurants <- readRDS(
+  "data/new_orleans/business_new_orleans.rds"
+)
+
+# Verify dataset
+dim(restaurants)
+glimpse(restaurants)
+```
+
+After filtering, the cleaned datasets contained:
+
+- **2,259 New Orleans restaurants**
+- **476,421 restaurant reviews**
+
+The cleaned datasets were saved as RDS files for use in the remaining analysis.
+
+The original data preparation code is available in `R/import_clean.R`.
+
+## 3. Restaurant Category Analysis
+
+### 3.1 Selecting Related Restaurant Categories
+
+To select a meaningful group of related restaurant categories, we first examined the frequency of Yelp categories among New Orleans restaurants. Because each restaurant can belong to multiple categories, the category strings were separated into individual values before counting.
+
+```{r}
+#| label: category-frequency
+
+category_counts <- restaurants %>%
+  select(business_id, categories) %>%
+  separate_rows(categories, sep = ",") %>%
+  mutate(categories = str_trim(categories)) %>%
+  filter(!is.na(categories), categories != "") %>%
+  count(categories, sort = TRUE)
+
+# Display the 30 most common categories
+category_counts %>%
+  slice_head(n = 30)
+```
+
+### 3.2 Category Counts & Overlap
+
+```{r}
+#| label: category-overlap
+
+selected_categories <- c("Cajun/Creole", "Seafood", "Southern")
+
+# Create one row per restaurant-category combination
+restaurant_categories <- restaurants %>%
+  select(business_id, categories) %>%
+  separate_rows(categories, sep = ",") %>%
+  mutate(categories = str_trim(categories)) %>%
+  filter(categories %in% selected_categories) %>%
+  distinct(business_id, categories)
+
+# Count restaurants in each category
+restaurant_categories %>%
+  count(categories, sort = TRUE)
+
+# Count how many selected categories each restaurant belongs to
+category_overlap <- restaurant_categories %>%
+  count(business_id, name = "n_categories") %>%
+  count(n_categories, name = "n_restaurants")
+
+category_overlap
+
+# Total unique restaurants across all three categories
+n_distinct(restaurant_categories$business_id)
+```
+
+The three selected categories include 648 unique restaurants in New Orleans. Cajun/Creole has the largest representation with 401 restaurants, followed by Seafood with 331 and Southern with 155.
+
+Because Yelp allows restaurants to have multiple categories, these counts overlap. Of the 648 restaurants, 443 belong to exactly one selected category, 171 belong to two, and 34 belong to all three. This overlap supports grouping these categories together for an analysis of New Orleans regional cuisine.
+
+### 3.3 Final Category Selection & Justification
+
+Cajun/Creole, Seafood, and Southern were selected because they represent related aspects of New Orleans and Louisiana's regional cuisine. These categories have substantial representation in the Yelp dataset and share a meaningful number of restaurants. Together, they provide a focused group for comparing restaurant ratings, reviewer behavior, and geographic patterns across New Orleans.
+
+### 3.4 Geographic Coverage of Selected Restaurants
+
+```{r}
+#| label: selected-geographic-coverage
+
+# Select restaurants belonging to our three categories
+selected_restaurants <- restaurants %>%
+  semi_join(restaurant_categories, by = "business_id")
+
+# Download census tracts (same as Homework 6)
+tracts <- tigris::tracts(
+  state = "LA",
+  county = "Orleans",
+  year = 2024,
+  cb = TRUE,
+  class = "sf"
+) %>%
+  st_transform(4326)
+
+# Convert selected restaurants to spatial points
+selected_points <- selected_restaurants %>%
+  filter(!is.na(latitude), !is.na(longitude)) %>%
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+# Assign restaurants to census tracts
+selected_tracts <- st_join(
+  selected_points,
+  tracts %>% select(GEOID),
+  left = TRUE
+)
+
+# Count restaurants in each tract
+tract_coverage <- selected_tracts %>%
+  st_drop_geometry() %>%
+  filter(!is.na(GEOID)) %>%
+  count(GEOID, name = "n_restaurants", sort = TRUE)
+
+# Summary of geographic coverage
+tract_coverage %>%
+  summarise(
+    total_tracts = n(),
+    tracts_with_10_or_more = sum(n_restaurants >= 10),
+    max_restaurants = max(n_restaurants)
+  )
+
+# Show the 15 tracts with the most restaurants
+tract_coverage %>%
+  slice_head(n = 15)
+```
+
+The selected Cajun/Creole, Seafood, and Southern restaurants were assigned to 2024 Census tracts in Orleans Parish using their geographic coordinates. The results show that restaurants are distributed across 108 census tracts, with 9 tracts containing at least 10 restaurants each. The highest concentration is 111 restaurants in a single tract.
+
+This satisfies the project's geographic coverage requirement of at least 10 restaurants in at least 7 geographic areas. Census tracts will therefore be used as the primary geographic unit for the remaining analysis.
+
+## 4. Restaurant & Review Join
+
+### 4.1 Joining Business and Review Data
+
+The cleaned Yelp review dataset was joined with the 648 selected restaurants using `business_id`, a shared identifier between the business and review datasets. This allows each review to be associated with its restaurant information, including category, location, and overall Yelp rating.
+
+The cleaned review data was stored in two RDS files to accommodate GitHub's file size limitations.
+
+```{r}
+#| label: join-reviews
+
+# Load cleaned reviews from Homework 5
+reviews_part1 <- readRDS(
+  "data/new_orleans/reviews_part1.rds"
+)
+
+reviews_part2 <- readRDS(
+  "data/new_orleans/reviews_part2.rds"
+)
+
+# Combine review files
+reviews <- bind_rows(reviews_part1, reviews_part2)
+
+# Join reviews with selected restaurants
+restaurant_reviews <- reviews %>%
+  inner_join(
+    selected_restaurants,
+    by = "business_id",
+    suffix = c("_review", "_business")
+  )
+
+# Check resulting dataset
+dim(restaurant_reviews)
+glimpse(restaurant_reviews)
+```
+
+### 4.2 Validating the Joined Dataset
+
+```{r}
+#| label: validate-review-join
+
+# Number of reviews and restaurants after joining
+restaurant_reviews %>%
+  summarise(
+    total_reviews = n(),
+    unique_restaurants = n_distinct(business_id),
+    unique_reviewers = n_distinct(user_id)
+  )
+
+# Check for duplicate review IDs
+restaurant_reviews %>%
+  summarise(
+    duplicate_review_ids = sum(duplicated(review_id))
+  )
+
+# Restaurants without matching reviews
+selected_restaurants %>%
+  anti_join(reviews, by = "business_id") %>%
+  summarise(restaurants_without_reviews = n())
+```
+
+The join produced 248,426 reviews across 648 unique restaurants and 138,073 unique reviewers. The resulting dataset contains 20 columns combining review-level information with restaurant attributes.
+
+Validation confirmed that there were no duplicate review IDs and no selected restaurants without matching reviews. These results indicate that the join preserved all selected restaurants without introducing duplicate reviews. The joined dataset will be used for the subsequent reviewer and restaurant rating analyses.
+
+## 5. Geographic Boundary Analysis
+
+### 5.1 Obtaining Official Geographic Boundaries
+
+Geographic boundaries were obtained from the U.S. Census Bureau using the `tigris` R package. The analysis uses 2024 Census tract boundaries for Orleans Parish and the official Census place boundary for New Orleans, Louisiana.
+
+Census tracts provide smaller geographic units for comparing restaurant distribution, while the city boundary allows us to validate whether restaurants labeled as New Orleans in the Yelp dataset are located within the official geographic boundary.
+
+```{r}
+#| label: city-boundary
+
+# Download official New Orleans place boundary
+la_places <- tigris::places(
+  state = "LA",
+  year = 2024,
+  cb = TRUE,
+  class = "sf"
+)
+
+new_orleans_boundary <- la_places %>%
+  filter(NAME == "New Orleans") %>%
+  st_transform(4326)
+
+# Verify the boundary was found
+nrow(new_orleans_boundary)
+```
+
+### 5.2 Spatial Join
+
+The selected restaurant coordinates were converted into spatial point features using `sf`. Each restaurant was assigned to a Census tract through a spatial join. A separate spatial check was performed against the official New Orleans city boundary to determine whether each restaurant falls within the city limits.
+
+```{r}
+#| label: city-spatial-check
+
+# Check whether each restaurant is within New Orleans
+city_check <- selected_points %>%
+  mutate(
+    inside_city = lengths(
+      st_intersects(geometry, new_orleans_boundary)
+    ) > 0
+  )
+
+# Count restaurants inside and outside the boundary
+city_check %>%
+  st_drop_geometry() %>%
+  count(inside_city)
+```
+
+### 5.3 Geographic Validation & Mismatch Checks
+
+```{r}
+#| label: geographic-validation
+
+# Check Census tract assignment
+selected_tracts %>%
+  st_drop_geometry() %>%
+  summarise(
+    total_restaurants = n_distinct(business_id),
+    matched_to_tract = n_distinct(business_id[!is.na(GEOID)]),
+    unmatched_to_tract = n_distinct(business_id[is.na(GEOID)])
+  )
+
+# Inspect restaurants outside the official city boundary
+city_check %>%
+  st_drop_geometry() %>%
+  filter(!inside_city) %>%
+  select(business_id, name, address, latitude, longitude) %>%
+  head(10)
+```
+
+Of the 648 selected restaurants, 632 (97.5%) fall within the official 2024 Census boundary for New Orleans, while 16 (2.5%) fall outside it. The Census tract spatial join also matched 632 restaurants, leaving 16 unmatched.
+
+Inspection of the unmatched restaurants revealed addresses along Jefferson Highway, Clearview Parkway, and other locations that may fall outside the city's official boundaries. This suggests that Yelp's city labels may include businesses in nearby areas.
+
+For geographic comparisons, the analysis will use the 632 restaurants successfully matched to Census tracts. The full set of 648 restaurants and their reviews will be retained for non-geographic analyses, with this distinction documented in the report.
+
+### 5.4 Geographic Visualization
+
+```{r}
+#| label: geographic-map
+#| fig-width: 10
+#| fig-height: 7
+
+ggplot() +
+  geom_sf(
+    data = new_orleans_boundary,
+    fill = "gray95",
+    color = "gray40",
+    linewidth = 0.5
+  ) +
+  geom_sf(
+    data = city_check,
+    aes(color = inside_city),
+    size = 1.5,
+    alpha = 0.7
+  ) +
+  scale_color_manual(
+    values = c("FALSE" = "red", "TRUE" = "steelblue"),
+    labels = c("Outside boundary", "Inside boundary"),
+    name = "Location"
+  ) +
+  labs(
+    title = "Selected Restaurants in New Orleans",
+    subtitle = "632 restaurants inside city limits | 16 outside",
+    caption = "Source: Yelp Open Dataset and U.S. Census Bureau (2024)"
+  ) +
+  theme_minimal()
+```
+
+The map shows the geographic distribution of 648 selected Cajun/Creole, Seafood, and Southern restaurants relative to the official New Orleans city boundary. Most restaurants are concentrated in the southwestern portion of the mapped area, while 16 restaurants fall outside the city boundary.
+
+These findings demonstrate the importance of validating geographic coordinates rather than relying exclusively on Yelp's city labels. The 632 restaurants within the boundary will be used for census tract comparisons.
+
+## 6. Geographic Comparison (Homework 6)
+
+### 6.1 Comparing Geographic Systems
+
+Four geographic systems were compared to identify a suitable unit for analyzing restaurant distribution and Yelp ratings in New Orleans: Census tracts, ZIP Code Tabulation Areas (ZCTAs), Census block groups, and Neighborhood Statistical Areas.
+
+The initial comparison uses all 2,259 restaurants from the cleaned Yelp dataset. Census tracts and block groups use 2024 U.S. Census Bureau boundaries, ZCTAs use 2020 Census boundaries, and neighborhoods use the City of New Orleans geographic dataset.
+
+The comparison considers the number of geographic areas, restaurant coverage, restaurant counts per area, and average Yelp ratings. Areas containing no restaurants are included to provide a more complete assessment of geographic coverage.
+
+```{r}
+#| label: geographic-systems-setup
+#| message: false
+#| warning: false
+
+# Full restaurant dataset from Homework 5
+restaurants <- readRDS("data/new_orleans/business_new_orleans.rds")
+
+# Geographic boundaries
+tracts <- tigris::tracts(
+  state = "LA", county = "Orleans",
+  year = 2024, cb = TRUE, class = "sf"
+) |>
+  st_transform(4326)
+
+zctas <- tigris::zctas(
+  year = 2020, cb = TRUE, class = "sf"
+) |>
+  st_transform(4326)
+
+block_groups <- tigris::block_groups(
+  state = "LA", county = "Orleans",
+  year = 2024, cb = TRUE, class = "sf"
+) |>
+  st_transform(4326)
+
+neighborhoods <- st_read(
+  "data/geography/neighborhoods.geojson",
+  quiet = TRUE
+) |>
+  st_transform(4326) |>
+  mutate(area_id = as.character(row_number()))
+
+# Convert restaurants into spatial points
+restaurant_points <- restaurants |>
+  filter(!is.na(latitude), !is.na(longitude)) |>
+  st_as_sf(
+    coords = c("longitude", "latitude"),
+    crs = 4326,
+    remove = FALSE
+  )
+
+# Restrict comparison boundaries to Orleans Parish
+orleans_boundary <- st_union(tracts)
+
+local_zctas <- st_filter(zctas, orleans_boundary)
+local_neighborhoods <- st_filter(neighborhoods, orleans_boundary)
+```
+
+### 6.2 Geographic Summary Statistics
+
+```{r}
+#| label: geographic-comparison
+#| message: false
+#| warning: false
+
+compare_geography <- function(boundaries, id_column, system_name) {
+
+  assigned <- st_join(
+    restaurant_points,
+    boundaries |> select(all_of(id_column)),
+    left = TRUE
+  ) |>
+    st_drop_geometry() |>
+    mutate(area_id = as.character(.data[[id_column]]))
+
+  multiple_matches <- assigned |>
+    filter(!is.na(area_id)) |>
+    count(business_id) |>
+    filter(n > 1) |>
+    nrow()
+
+  matched <- assigned |>
+    filter(!is.na(area_id)) |>
+    group_by(business_id) |>
+    filter(n() == 1) |>
+    ungroup()
+
+  area_summary <- matched |>
+    group_by(area_id) |>
+    summarise(
+      restaurant_count = n(),
+      average_rating = mean(stars, na.rm = TRUE),
+      .groups = "drop"
+    )
+
+  all_areas <- boundaries |>
+    st_drop_geometry() |>
+    transmute(area_id = as.character(.data[[id_column]])) |>
+    distinct() |>
+    left_join(area_summary, by = "area_id") |>
+    mutate(
+      restaurant_count = replace_na(restaurant_count, 0L)
+    )
+
+  tibble(
+    geographic_system = system_name,
+    number_of_areas = nrow(all_areas),
+    restaurants_assigned = n_distinct(matched$business_id),
+    unmatched_restaurants =
+      nrow(restaurants) - n_distinct(matched$business_id),
+    multiple_area_matches = multiple_matches,
+    smallest_area_count = min(all_areas$restaurant_count),
+    largest_area_count = max(all_areas$restaurant_count),
+    average_restaurants_per_area =
+      mean(all_areas$restaurant_count),
+    median_restaurants_per_area =
+      median(all_areas$restaurant_count),
+    areas_under_5 = sum(all_areas$restaurant_count < 5),
+    average_business_rating =
+      mean(matched$stars, na.rm = TRUE)
+  )
+}
+
+comparison_full <- bind_rows(
+  compare_geography(tracts, "GEOID", "Census tracts"),
+  compare_geography(local_zctas, "ZCTA5CE20", "ZCTAs"),
+  compare_geography(block_groups, "GEOID", "Census block groups"),
+  compare_geography(local_neighborhoods, "area_id", "Neighborhoods")
+)
+
+knitr::kable(
+  comparison_full,
+  digits = 2,
+  caption = "Comparison of Four Geographic Systems in New Orleans"
+)
+```
+
+The geographic comparison reveals differences in restaurant coverage and sample sizes across the four systems. Census tracts provide a median of 4 restaurants per area, compared with 6 for ZCTAs, 1 for block groups, and 11 for neighborhoods.
+
+Block groups provide the greatest geographic detail, but many contain too few restaurants for meaningful comparisons. ZCTAs and neighborhoods provide larger sample sizes but may hide differences within smaller areas. Census tracts offer a compromise between geographic detail and restaurant sample size.
+
+### 6.3 Maps & Visualizations
+
+```{r}
+#| label: geographic-map-data
+#| message: false
+#| warning: false
+
+restaurants_tracts <- st_join(
+  restaurant_points,
+  tracts |> select(GEOID),
+  left = FALSE
+)
+
+restaurants_zctas <- st_join(
+  restaurant_points,
+  zctas |> select(ZCTA5CE20),
+  left = FALSE
+)
+
+restaurants_blocks <- st_join(
+  restaurant_points,
+  block_groups |> select(GEOID),
+  left = FALSE
+)
+
+restaurants_neighborhoods <- st_join(
+  restaurant_points,
+  neighborhoods |> select(area_id),
+  left = FALSE
+)
+```
+
+#### Map 1: Census tracts
+
+```{r}
+#| label: census-tract-map
+#| fig-width: 10
+#| fig-height: 7
+
+tract_counts <- restaurants_tracts |>
+  st_drop_geometry() |>
+  count(GEOID, name = "restaurant_count")
+
+tract_map <- tracts |>
+  left_join(tract_counts, by = "GEOID") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(tract_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution Across Orleans Parish",
+    subtitle = "Yelp restaurants by Census tract",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+Restaurants are concentrated in a few central census tracts, with fewer restaurants in surrounding areas.
+
+#### Map 2: Census block groups
+
+```{r}
+#| label: block-group-map
+#| fig-width: 10
+#| fig-height: 7
+
+block_counts <- restaurants_blocks |>
+  st_drop_geometry() |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    .by = GEOID
+  )
+
+block_map <- block_groups |>
+  left_join(block_counts, by = "GEOID") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(block_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution by Census Block Group",
+    subtitle = "Orleans Parish, Louisiana",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+Block groups provide a more detailed view of restaurant concentrations, highlighting smaller geographic differences.
+
+#### Map 3: ZCTAs
+
+```{r}
+#| label: zcta-map
+#| fig-width: 10
+#| fig-height: 7
+
+zcta_counts <- restaurants_zctas |>
+  st_drop_geometry() |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    .by = ZCTA5CE20
+  )
+
+zcta_map <- local_zctas |>
+  left_join(zcta_counts, by = "ZCTA5CE20") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(zcta_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.2
+  ) +
+  coord_sf(
+    xlim = st_bbox(tracts)[c("xmin", "xmax")],
+    ylim = st_bbox(tracts)[c("ymin", "ymax")]
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution by ZCTA",
+    subtitle = "ZCTAs intersecting Orleans Parish",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+Restaurant activity is concentrated in a few ZCTAs, but larger boundaries provide less geographic detail.
+
+#### Map 4: Neighborhoods
+
+```{r}
+#| label: neighborhood-map
+#| fig-width: 10
+#| fig-height: 7
+
+neighborhood_counts <- restaurants_neighborhoods |>
+  st_drop_geometry() |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    .by = area_id
+  )
+
+neighborhood_map <- local_neighborhoods |>
+  left_join(neighborhood_counts, by = "area_id") |>
+  mutate(
+    restaurant_count = replace_na(restaurant_count, 0L)
+  )
+
+ggplot(neighborhood_map) +
+  geom_sf(
+    aes(fill = restaurant_count),
+    color = "white",
+    linewidth = 0.2
+  ) +
+  scale_fill_viridis_c(option = "viridis") +
+  labs(
+    title = "Restaurant Distribution by Neighborhood",
+    subtitle = "New Orleans Neighborhood Statistical Areas",
+    fill = "Restaurants"
+  ) +
+  theme_minimal()
+```
+
+Restaurant concentrations vary across neighborhoods, with the highest counts in central areas.
+
+#### Map 5: Average Yelp ratings by Census tract
+
+```{r}
+#| label: census-tract-rating-map
+#| fig-width: 10
+#| fig-height: 7
+
+tract_rating_summary <- restaurants_tracts |>
+  st_drop_geometry() |>
+  group_by(GEOID) |>
+  summarise(
+    restaurant_count = n_distinct(business_id),
+    average_rating = mean(stars, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+tract_rating_map <- tracts |>
+  left_join(tract_rating_summary, by = "GEOID")
+
+ggplot(tract_rating_map) +
+  geom_sf(
+    aes(fill = average_rating),
+    color = "white",
+    linewidth = 0.1
+  ) +
+  scale_fill_viridis_c(
+    option = "viridis",
+    limits = c(1, 5),
+    na.value = "grey90"
+  ) +
+  labs(
+    title = "Average Yelp Restaurant Ratings by Census Tract",
+    subtitle = "Orleans Parish, Louisiana",
+    fill = "Average Rating"
+  ) +
+  theme_minimal()
+```
+
+Map 5: Average ratings vary across census tracts, showing geographic differences in restaurant ratings.
+
+\_
+
+Overall, the maps illustrate how restaurant distribution changes depending on the geographic system. Census block groups provide the most detailed view, but many areas contain few restaurants. ZCTAs show broader geographic patterns, while neighborhoods provide an intermediate level of detail.
+
+Census tracts offer a balance between geographic detail and restaurant sample size. The Census tract rating map also illustrates differences in average Yelp ratings across areas, although averages based on small numbers of restaurants should be interpreted cautiously.
+
+### 6.4 Final Geographic System Selection & Justification
+
+Census tracts were selected as the primary geographic unit for analyzing restaurant distribution and Yelp ratings in New Orleans.
+
+The Homework 6 comparison identified 184 Census tracts, with 2,202 of the 2,259 restaurants successfully assigned. The median was 4 restaurants per tract, compared with 6 for ZCTAs, 1 for block groups, and 11 for neighborhoods.
+
+Although Census block groups offer greater geographic detail, 342 of the 440 block groups contained fewer than five restaurants. ZCTAs and neighborhoods provide larger restaurant samples per area, but their broader boundaries can obscure local differences.
+
+Census tracts offer a reasonable compromise between geographic detail and sample size. However, 95 of the 184 tracts contained fewer than five restaurants, so comparisons of average ratings should be interpreted carefully.
+
+For the final analysis of Cajun/Creole, Seafood, and Southern restaurants, 632 of the 648 selected restaurants were successfully assigned to Census tracts. Nine tracts contained at least 10 selected restaurants, satisfying the project's minimum geographic coverage requirement.
+
+## 7. Reviewer & Rating Analysis
+
+### 7.1 All-Reviewer Rating Analysis
+
+```{r}
+# Calculate average ratings using all reviewers
+all_reviewer_ratings <- restaurant_reviews %>%
+  group_by(business_id, business_name) %>%
+  summarise(
+    total_reviews = n(),
+    avg_rating = mean(stars_review, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(avg_rating))
+
+# Overall rating summary
+all_reviewer_ratings %>%
+  summarise(
+    total_restaurants = n(),
+    average_rating = mean(avg_rating),
+    median_rating = median(avg_rating),
+    min_rating = min(avg_rating),
+    max_rating = max(avg_rating)
+  )
+
+# Top 10 restaurants by average rating
+all_reviewer_ratings %>%
+  slice_head(n = 10)
+```
+
+Across 648 selected restaurants, the average restaurant rating was 3.82 stars, with a median of 3.93 stars. Ratings ranged from 1 to 5 stars. Several restaurants received perfect ratings but had very few reviews, suggesting that average ratings alone may not provide reliable rankings. Review counts should also be considered when comparing restaurants.
+
+### 7.2 Selecting Active Reviewers
+
+```{r}
+# Count reviews per reviewer
+reviewer_activity <- restaurant_reviews %>%
+  group_by(user_id) %>%
+  summarise(
+    n_reviews = n(),
+    .groups = "drop"
+  )
+
+# Summarize reviewer activity
+reviewer_activity %>%
+  summarise(
+    total_reviewers = n(),
+    average_reviews = mean(n_reviews),
+    median_reviews = median(n_reviews),
+    max_reviews = max(n_reviews),
+    reviewers_5_plus = sum(n_reviews >= 5),
+    reviewers_10_plus = sum(n_reviews >= 10)
+  )
+```
+
+The dataset contains 138,073 unique reviewers, averaging 1.80 reviews per person. The median reviewer contributed only one review, while the most active reviewer contributed 245. For this analysis, active reviewers are defined as users who submitted at least five reviews within the selected restaurant dataset. This threshold identifies 7,052 reviewers and provides sufficient rating history to compare individual rating behavior.
+
+### 7.3 Reviewer-Normalized Ratings
+
+```{r}
+# Select reviewers with at least 5 reviews
+active_reviewers <- reviewer_activity %>%
+  filter(n_reviews >= 5)
+
+# Calculate each active reviewer's average rating
+active_reviews <- restaurant_reviews %>%
+  semi_join(active_reviewers, by = "user_id") %>%
+  group_by(user_id) %>%
+  mutate(
+    reviewer_mean = mean(stars_review, na.rm = TRUE),
+    normalized_rating = stars_review - reviewer_mean
+  ) %>%
+  ungroup()
+
+# Calculate normalized restaurant scores
+normalized_restaurant_ratings <- active_reviews %>%
+  group_by(business_id, business_name) %>%
+  summarise(
+    active_review_count = n(),
+    normalized_score = mean(normalized_rating, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(normalized_score))
+
+# Rank restaurants with at least 5 active-reviewer ratings
+normalized_restaurant_ratings %>%
+  filter(active_review_count >= 5) %>%
+  slice_head(n = 10)
+```
+
+### 7.4 Comparing Rating Methods
+
+```{r}
+# Compare original ratings with normalized ratings
+rating_comparison <- all_reviewer_ratings %>%
+  inner_join(
+    normalized_restaurant_ratings,
+    by = c("business_id", "business_name")
+  ) %>%
+  filter(active_review_count >= 5) %>%
+  mutate(
+    original_rank = min_rank(desc(avg_rating)),
+    normalized_rank = min_rank(desc(normalized_score)),
+    rank_change = original_rank - normalized_rank
+  ) %>%
+  arrange(normalized_rank)
+
+# View comparison
+rating_comparison %>%
+  select(
+    business_name,
+    total_reviews,
+    avg_rating,
+    active_review_count,
+    normalized_score,
+    original_rank,
+    normalized_rank,
+    rank_change
+  ) %>%
+  slice_head(n = 10)
+```
+
+The comparison shows that restaurant rankings change when reviewer rating habits are taken into account. For example, Pelican Bay moves from 99th place using average Yelp ratings to 4th place using reviewer-normalized scores. Orchid Seafood also improves from 39th to 9th place. These differences suggest that traditional average ratings and reviewer-normalized ratings can produce different restaurant rankings.
+
+However, normalized scores are based on a smaller group of active reviewers, so the results may be sensitive to sample size.
+
+## 8. Top 10 Restaurants & Final Map
+
+### 8.1 Ranking Methodology
+
+The final restaurant rankings use reviewer-normalized scores to account for differences in individual rating habits. Each reviewer's rating is adjusted by subtracting their average rating across the selected restaurant dataset. Restaurants are then ranked by their average normalized score. To reduce the influence of very small samples, only restaurants with at least five ratings from active reviewers are included.
+
+### 8.2 Top 10 Restaurant Results
+
+```{r}
+# Select the final top 10 restaurants
+top10_restaurants <- rating_comparison %>%
+  arrange(desc(normalized_score)) %>%
+  slice_head(n = 10) %>%
+  mutate(rank = row_number()) %>%
+  select(
+    rank,
+    business_id,
+    business_name,
+    avg_rating,
+    normalized_score,
+    active_review_count
+  )
+
+# Display a clean results table
+top10_restaurants %>%
+  mutate(
+    avg_rating = round(avg_rating, 2),
+    normalized_score = round(normalized_score, 3)
+  ) %>%
+  select(-business_id) %>%
+  knitr::kable(
+    caption = "Top 10 New Orleans Restaurants by Reviewer-Normalized Score"
+  )
+```
+
+### 8.3 Final Geographic Map
+
+```{r}
+# Join the top 10 rankings with restaurant coordinates
+top10_locations <- top10_restaurants %>%
+  left_join(
+    selected_restaurants %>%
+      select(business_id, latitude, longitude),
+    by = "business_id"
+  )
+
+# Convert restaurant locations to spatial points
+top10_points <- st_as_sf(
+  top10_locations,
+  coords = c("longitude", "latitude"),
+  crs = 4326,
+  remove = FALSE
+)
+
+# Plot the top 10 restaurants on the city boundary
+ggplot() +
+  geom_sf(
+    data = new_orleans_boundary,
+    fill = "grey95",
+    color = "grey40"
+  ) +
+  geom_sf(
+    data = top10_points,
+    aes(color = factor(rank)),
+    size = 3
+  ) +
+  geom_sf_text(
+    data = top10_points,
+    aes(label = rank),
+    size = 3,
+    nudge_y = 0.003
+  ) +
+  labs(
+    title = "Top 10 Restaurants in New Orleans",
+    subtitle = "Ranked by reviewer-normalized scores",
+    color = "Rank",
+    caption = "Source: Yelp Open Dataset and U.S. Census Bureau (2024)"
+  ) +
+  theme_minimal()
+```
+
+### 8.4 Interpretation of Findings
+
+```{r}
+# Match eligible restaurants to their Census tracts
+tract_restaurant_ratings <- selected_tracts %>%
+  st_drop_geometry() %>%
+  select(business_id, GEOID) %>%
+  filter(!is.na(GEOID)) %>%
+  distinct(business_id, GEOID) %>%
+  inner_join(
+    rating_comparison %>%
+      select(business_id, normalized_score, active_review_count),
+    by = "business_id"
+  )
+
+# Calculate average normalized score for each tract
+tract_rankings <- tract_restaurant_ratings %>%
+  group_by(GEOID) %>%
+  summarise(
+    n_restaurants = n_distinct(business_id),
+    total_active_reviews = sum(active_review_count),
+    avg_normalized_score = mean(normalized_score),
+    .groups = "drop"
+  ) %>%
+  filter(n_restaurants >= 3) %>%
+  arrange(desc(avg_normalized_score))
+
+# Display the highest-ranking tracts
+
+tract_rankings %>%
+  slice_head(n = 10) %>%
+  mutate(avg_normalized_score = round(avg_normalized_score, 3)) %>%
+  knitr::kable(
+    col.names = c(
+      "Census Tract",
+      "Restaurants",
+      "Active Reviews",
+      "Avg. Normalized Score"
+    ),
+    caption = "Top Census Tracts by Average Reviewer-Normalized Score"
+  )
+
+```
+
+The top 10 restaurants were ranked using reviewer-normalized scores, which account for differences in individual reviewers' rating habits. **3 Southern Girls** ranked first with a normalized score of 1.241, followed by **Cafe Porche and snowbar** (0.759) and **La Vie En Rose Cafe** (0.741).
+
+The rankings differed from those based on average review ratings. For example, **Pelican Bay** moved from 99th to 4th place after normalization, showing how adjusting for reviewer behavior can change restaurant rankings.
+
+To identify the strongest geographic areas, census tracts were compared using the average reviewer-normalized scores of eligible restaurants. Only tracts containing at least three eligible restaurants were included. Census tract **22071003702** ranked highest, with four restaurants, 147 active-reviewer ratings, and an average normalized score of 0.341. It was followed by tracts **22071004900** (0.246) and **22071004401** (0.219).
+
+Geographically, several top-ranked restaurants are concentrated in the southwestern portion of New Orleans. However, the highest-ranked restaurant, 3 Southern Girls, falls outside the official city boundary, highlighting differences between Yelp's city labels and Census boundaries.
+
+Overall, the results suggest that reviewer normalization provides a different perspective on restaurant quality, with tract **22071003702** ranking highest under the selected method. However, the findings should be interpreted cautiously because some restaurants and tracts have relatively small samples, which may affect ranking reliability.
+
+## 9. Conclusions & Limitations
+
+### 9.1 Key Findings
+
+This project analyzed Yelp restaurant data in New Orleans, focusing on Cajun/Creole, Seafood, and Southern restaurants. A total of 648 restaurants were selected, with 632 located inside the official city boundary and 16 outside.
+
+The geographic comparison showed that Census tracts provide a useful balance between geographic detail and restaurant coverage. Using average reviewer-normalized scores, census tract **22071003702** ranked highest among eligible tracts, with four restaurants, 147 active-reviewer ratings, and an average normalized score of 0.341.
+
+Reviewer-normalized ratings also produced different restaurant rankings compared with traditional average review ratings. **3 Southern Girls** ranked first with a normalized score of 1.241, followed by **Cafe Porche and snowbar** (0.759) and **La Vie En Rose Cafe** (0.741). **Pelican Bay** moved from 99th to 4th place after normalization within the eligible comparison group.
+
+### 9.2 Limitations
+
+Several limitations should be considered when interpreting the results:
+
+- **Geographic boundaries:** Yelp's New Orleans city labels do not always match official Census boundaries, resulting in some restaurants appearing outside city limits.
+- **Review representation:** Yelp reviewers may not represent all restaurant customers, and some restaurants have significantly more reviews than others.
+- **Small sample sizes:** Some restaurants received relatively few reviews from active reviewers, making their normalized scores less reliable.
+- **Reviewer normalization:** Adjusting ratings based on individual reviewer averages helps account for rating differences but does not eliminate all forms of bias.
+- **Dataset coverage:** The analysis reflects restaurants and reviews available in the Yelp Open Dataset rather than a complete or current inventory of New Orleans restaurants.
+- **Geographic ranking:** Census tracts were ranked using the unweighted average of eligible restaurants' normalized scores. Tracts with fewer restaurants may have less stable rankings, and restaurants with different review counts contributed equally to the tract average.
+
+### 9.3 Final Conclusion
+
+Overall, this analysis identified the highest-ranked Cajun/Creole, Seafood, and Southern restaurants in New Orleans after adjusting for differences in reviewers' rating habits. **3 Southern Girls** ranked highest using reviewer-normalized scores, while census tract **22071003702** had the highest average normalized restaurant score among eligible geographic areas.
+
+The findings demonstrate how reviewer behavior and geographic boundaries can influence restaurant comparisons. Although normalization provides an alternative perspective to traditional ratings, the results should be interpreted alongside review counts, sample sizes, and geographic limitations rather than treated as definitive measures of restaurant quality.
+
+## 10. Data Management & Reproducibility
+
+### 10.1 Handling Large Yelp Datasets
+
+The Yelp Open Dataset contains large JSON files that require careful data management. The original business and review datasets were obtained from the Yelp Open Dataset and stored locally in data/raw/. After downloading the Yelp Open Dataset, the archive was extracted locally to access the business and review JSON files used for data preparation. These files were not uploaded to GitHub because of their size.
+
+The business dataset was imported using `jsonlite::stream_in()`, while the larger review dataset was processed in smaller chunks to reduce memory usage. The data was then filtered to New Orleans restaurants and their associated reviews, reducing the amount of data needed for the remaining analysis.
+
+After cleaning, the datasets contained 2,259 restaurants and 476,421 reviews. These were saved as compressed RDS files to avoid repeatedly importing and processing the original JSON files.
+
+The combined review dataset exceeded GitHub's 100 MB file size limit, so it was divided into two smaller files: `reviews_part1.rds` and `reviews_part2.rds`. These files were combined using `bind_rows()` during the analysis.
+
+This approach reduced repeated processing, made the project easier to manage, and allowed the cleaned data and analysis code to be maintained separately from the original large JSON files.
+
+### 10.2 Project File Organization
+
+The project is organized into separate directories for data, scripts, and analysis reports.
+
+- `R/import_clean.R`: Imports and cleans the original Yelp datasets.
+
+- `data/raw/`: Stores the original Yelp JSON files locally.
+
+- `data/new_orleans/`: Contains the cleaned restaurant and review RDS files.
+
+- `data/geography/`: Stores geographic boundary data used for spatial analysis.
+
+- `geographic_analysis.qmd`: Contains the earlier geographic comparison from Homework 6.
+
+- `yelp_new_orleans_project.qmd`: Contains the complete Project 2 analysis and final report.
+
+- `README.md`: Provides an overview of the project and instructions for accessing the analysis.
+
+The original large JSON files are excluded from GitHub using .gitignore, while the cleaned datasets and analysis code are maintained in the repository.
+
+### 10.3 Reproducibility
+
+The analysis was completed using R, RStudio, and Quarto. The project includes code for data preparation, restaurant category selection, relational joins, geographic comparisons, reviewer-normalized ratings, and visualizations.
+
+To reproduce the analysis, users can clone the GitHub repository and install the required R packages, including `tidyverse`, `jsonlite`, `lubridate`, `sf`, `tigris`, `scales`, `viridis`, and `knitr`.
+
+The cleaned RDS datasets are stored in `data/new_orleans/`. These files allow users to run the analysis without reprocessing the original large Yelp JSON files. Users can open `yelp_new_orleans_project.qmd` in RStudio and render it using Quarto to generate the final HTML report.
+
+The original data preparation script, `R/import_clean.R`, documents how the Yelp datasets were imported and cleaned. Geographic boundary data is obtained from U.S. Census sources using the `tigris` package.
+
+The project README provides information about the repository structure, data sources, and instructions for accessing the final report.
+
+## 11. AI Usage & Prompting
+
+### 11.1 How AI Was Used
+
+ChatGPT was used as a supporting tool throughout this project to assist with R programming, debugging, data analysis, and report organization.
+
+AI assistance included developing code for restaurant category comparisons, geographic visualizations, reviewer-normalized ratings, and restaurant rankings. It was also used to explain errors, improve code readability, and organize findings into a structured Quarto report.
+
+### 11.2 Example Prompts & Reprompting
+
+The following examples summarize AI interactions during the project.
+
+**Example 1: Debugging R Code**
+
+- **Initial prompt:** "Help me calculate average restaurant ratings using all reviewers."
+
+- **Issue:** The code referenced joined_data, which did not exist in the current project.
+
+- **Reprompt:** "My joined dataset is named restaurant_reviews. How should I fix the code?"
+
+- **Resolution:** The code was updated to reference the correct dataset.
+
+**Example 2: Reviewer-Normalized Rankings**
+
+- **Initial prompt:** "Calculate reviewer-normalized ratings and identify the top 10 restaurants."
+
+- **Issue:** Some restaurants had very few reviews from active reviewers, making their rankings less reliable.
+
+- **Reprompt:** "How can I require restaurants to have at least five active-reviewer ratings?"
+
+- **Resolution:** A minimum of five active-reviewer ratings was applied before selecting the top 10 restaurants.
+
+**Example 3: Geographic Visualization**
+
+- **Initial prompt:** "Create a map showing the top 10 restaurants within the New Orleans boundary."
+
+- **Issue:** R displayed a warning about using st_point_on_surface() with longitude and latitude coordinates.
+
+- **Reprompt:** "How can I resolve the spatial warning without changing the restaurant locations?"
+
+- **Resolution:** The geographic calculation was adjusted to address the warning while preserving the original restaurant coordinates.
+
+### 11.3 Verification of AI-Assisted Work
+
+AI-generated code and suggestions were reviewed and tested in RStudio before being included in the final report.
+
+The analysis outputs were checked to confirm restaurant counts, review totals, geographic assignments, and rating calculations. Visualizations were rendered and inspected to identify potential errors or inconsistencies.
+
+When errors or unexpected results occurred, the code was revised and rerun. Final interpretations were based on the resulting data rather than relying solely on AI-generated explanations.
+
+AI was used to support the analysis, while the final results were evaluated using the project datasets and R outputs.
